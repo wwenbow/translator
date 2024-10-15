@@ -1,0 +1,14 @@
+pytesseract
+keyboard
+mss
+screeninfo
+flask
+flask-socketio
+openai
+cnocr
+onnxruntime
+pyautogui 
+pillow 
+googletrans
+gevent
+gevent-websocket
