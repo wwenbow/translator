@@ -13,11 +13,11 @@ import base64
 from openai import OpenAI
 from cnocr import CnOcr
 
-hotkey = 'ctrl+f3'
+hotkey = 'f10'
 exit_hotkey = 'f12'
-monitor_idx = 1
+monitor_idx = 0
 
-client = OpenAI()
+# client = OpenAI()
 
 # Ensure Tesseract is installed and the path is configured (update with your path)
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
