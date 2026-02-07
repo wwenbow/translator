@@ -1,5 +1,5 @@
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import keyboard
 # from googletrans import Translator
 from mss import mss
@@ -12,6 +12,8 @@ import io
 import base64
 from openai import OpenAI
 from cnocr import CnOcr
+from collections import deque
+from datetime import datetime
 
 hotkey = 'f10'
 exit_hotkey = 'f12'
@@ -36,6 +38,11 @@ socketio = SocketIO(app, async_mode='gevent')
 translated_text_global = ""
 extracted_text_global = ""
 image_global = ""
+overlay_image_global = ""
+overlay_boxes_global = []
+image_size_global = (0, 0)
+capture_history = deque(maxlen=50)
+capture_counter = 0
 
 def get_monitor(idx):
     # Get a list of connected monitors
@@ -48,8 +55,13 @@ def get_monitor(idx):
 
 def capture_screen_second_monitor():
     global translated_text_global
-    global extracted_text_global 
+    global extracted_text_global
     global image_global
+    global overlay_image_global
+    global overlay_boxes_global
+    global image_size_global
+    global capture_history
+    global capture_counter
     try:
         # Get the selected monitor details
         selected_monitor = get_monitor(monitor_idx)
@@ -72,7 +84,7 @@ def capture_screen_second_monitor():
 
             # Convert the raw screenshot to a PIL Image
             img = Image.frombytes("RGB", (screenshot.width, screenshot.height), screenshot.rgb)
-            # img.show()
+            image_size_global = (img.width, img.height)
 
             # Save the image to a BytesIO object (in-memory file)
             img_bytes = io.BytesIO()
@@ -110,8 +122,63 @@ def capture_screen_second_monitor():
 
             extracted_text = ocr.ocr(img)
 
-            extracted_text_global = extracted_text
+            # Build a newline string for display and render an overlay with boxes + text.
+            extracted_lines = []
+            for item in extracted_text:
+                if not isinstance(item, dict):
+                    continue
+                text_val = item.get("text")
+                if text_val is None:
+                    continue
+                text_str = text_val if isinstance(text_val, str) else str(text_val)
+                if text_str:
+                    extracted_lines.append(text_str)
+            extracted_text_global = "\n".join(extracted_lines) if extracted_lines else str(extracted_text)
+
+            def build_overlay_boxes(ocr_results):
+                boxes = []
+                for item in ocr_results or []:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text")
+                    polygon = item.get("position")
+                    if text is None or polygon is None:
+                        continue
+
+                    text_str = text if isinstance(text, str) else str(text)
+
+                    try:
+                        points = [tuple(p) for p in polygon]
+                        xs = [p[0] for p in points]
+                        ys = [p[1] for p in points]
+                        min_x, max_x = min(xs), max(xs)
+                        min_y, max_y = min(ys), max(ys)
+                    except Exception:
+                        continue
+
+                    boxes.append({
+                        "text": text_str,
+                        "left": int(min_x),
+                        "top": int(min_y),
+                        "width": int(max_x - min_x),
+                        "height": int(max_y - min_y)
+                    })
+                return boxes
+
+            overlay_boxes_global = build_overlay_boxes(extracted_text)
             print(f"Extracted Text: {extracted_text}")
+
+            capture_counter += 1
+            capture_history.appendleft({
+                "id": capture_counter,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "image": image_global,
+                "overlay_boxes": overlay_boxes_global,
+                "image_width": image_size_global[0],
+                "image_height": image_size_global[1],
+                "extracted_text": extracted_text_global,
+                "translated_text": translated_text_global,
+            })
 
             # Emit a message to the client to refresh the page
             socketio.send({'data': 'Refresh the page'}, namespace='/')
@@ -171,6 +238,37 @@ def show_translated_text():
                 });
             </script>
         </head>
+        <style>
+            .overlay-container {
+                position: relative;
+                width: {{ image_width }};
+                height: {{ image_height }};
+                background-image: url('{{ image }}');
+                background-size: 100% 100%;
+                background-repeat: no-repeat;
+                border: 1px solid #ddd;
+            }
+            .overlay-text {
+                position: absolute;
+                color: red;
+                font-size: 16px;
+                line-height: 1.2;
+                white-space: pre-wrap;
+                padding: 0;
+                margin: 0;
+            }
+            .history-item {
+                border: 1px solid #ccc;
+                padding: 8px;
+                margin-bottom: 12px;
+            }
+            .history-image {
+                position: relative;
+                border: 1px solid #eee;
+                margin-top: 6px;
+                overflow: hidden;
+            }
+        </style>
         <body>
             <h1>Extracted Text</h1>
             <pre>{{ extracted_text }}</pre>
@@ -179,9 +277,33 @@ def show_translated_text():
             <h1>Translated Text</h1>
             <pre>{{ translated_text }}</pre>
         </body>
-        <img src={{ image }} width="854" height="460"/>
+        <body>
+            <h1>Overlay (Selectable Text)</h1>
+            <div class="overlay-container">
+                {% for box in overlay_boxes %}
+                    <div class="overlay-text" style="left: {{ box.left }}px; top: {{ box.top }}px; width: {{ box.width }}px; height: {{ box.height }}px;">{{ box.text }}</div>
+                {% endfor %}
+            </div>
+        </body>
+        <img src="{{ image }}" width="854" height="460"/>
+
+        <body>
+            <h1>History (Last {{ history|length }} captures, max 50)</h1>
+            {% for item in history %}
+                <div class="history-item">
+                    <div><strong>#{{ item.id }}</strong> — {{ item.timestamp }}</div>
+                    <div>Extracted:</div>
+                    <pre>{{ item.extracted_text }}</pre>
+                    <div class="history-image" style="width: {{ item.image_width }}px; height: {{ item.image_height }}px; background-image: url('{{ item.image }}'); background-size: 100% 100%; background-repeat: no-repeat;">
+                        {% for box in item.overlay_boxes %}
+                            <div class="overlay-text" style="left: {{ box.left }}px; top: {{ box.top }}px; width: {{ box.width }}px; height: {{ box.height }}px;">{{ box.text }}</div>
+                        {% endfor %}
+                    </div>
+                </div>
+            {% endfor %}
+        </body>
     </html>
-    ''', translated_text=translated_text_global, extracted_text=extracted_text_global, image=image_global)
+    ''', translated_text=translated_text_global, extracted_text=extracted_text_global, image=image_global, overlay_image=overlay_image_global, overlay_boxes=overlay_boxes_global, image_width=f"{image_size_global[0]}px", image_height=f"{image_size_global[1]}px", history=list(capture_history))
 
 # Run the Flask app in a separate thread
 def run_flask_app():
