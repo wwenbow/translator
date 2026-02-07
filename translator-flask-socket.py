@@ -14,10 +14,24 @@ from openai import OpenAI
 from cnocr import CnOcr
 from collections import deque
 from datetime import datetime
+import pyttsx3
+import queue
+try:
+    import pythoncom
+except Exception:
+    pythoncom = None
+try:
+    import win32com.client as win32com_client
+except Exception:
+    win32com_client = None
 
 hotkey = 'f10'
 exit_hotkey = 'f12'
 monitor_idx = 0
+tts_region_x = 700
+tts_region_y = 1000
+tts_region_width = 1000
+tts_region_height = 1000
 
 # client = OpenAI()
 
@@ -43,6 +57,77 @@ overlay_boxes_global = []
 image_size_global = (0, 0)
 capture_history = deque(maxlen=50)
 capture_counter = 0
+tts_queue = queue.Queue()
+tts_worker = None
+
+def configure_tts_voice(engine):
+    # Prefer a Chinese-capable voice when available.
+    try:
+        for voice in engine.getProperty('voices') or []:
+            name = (getattr(voice, "name", "") or "").lower()
+            langs = getattr(voice, "languages", []) or []
+            if "zh" in name or "chinese" in name or any(b"zh" in l for l in langs if isinstance(l, (bytes, bytearray))):
+                engine.setProperty('voice', voice.id)
+                break
+    except Exception:
+        pass
+
+def _tts_worker_loop():
+    if pythoncom is not None:
+        try:
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+    sapi_voice = None
+    engine = None
+    if win32com_client is not None:
+        try:
+            sapi_voice = win32com_client.Dispatch("SAPI.SpVoice")
+        except Exception as e:
+            print(f"TTS SAPI init error: {e}")
+            sapi_voice = None
+    if sapi_voice is None:
+        try:
+            engine = pyttsx3.init()
+            configure_tts_voice(engine)
+        except Exception as e:
+            print(f"TTS init error: {e}")
+    while True:
+        text = tts_queue.get()
+        if text is None:
+            break
+        try:
+            if sapi_voice is not None:
+                sapi_voice.Speak(text)
+            else:
+                if engine is None:
+                    engine = pyttsx3.init()
+                    configure_tts_voice(engine)
+                engine.say(text)
+                engine.runAndWait()
+        except Exception as e:
+            print(f"TTS error: {e}")
+        finally:
+            tts_queue.task_done()
+    if engine is not None:
+        try:
+            engine.stop()
+        except Exception:
+            pass
+    if pythoncom is not None:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+def speak_text(text):
+    global tts_worker
+    if not text or not text.strip():
+        return
+    tts_queue.put(text)
+    if tts_worker is None or not tts_worker.is_alive():
+        tts_worker = threading.Thread(target=_tts_worker_loop, daemon=True)
+        tts_worker.start()
 
 def get_monitor(idx):
     # Get a list of connected monitors
@@ -124,6 +209,14 @@ def capture_screen_second_monitor():
 
             # Build a newline string for display and render an overlay with boxes + text.
             extracted_lines = []
+            tts_lines = []
+            region_x = max(0, int(tts_region_x))
+            region_y = max(0, int(tts_region_y))
+            region_w = int(tts_region_width)
+            region_h = int(tts_region_height)
+            region_right = region_x + region_w
+            region_bottom = region_y + region_h
+            tts_line = ""
             for item in extracted_text:
                 if not isinstance(item, dict):
                     continue
@@ -133,6 +226,29 @@ def capture_screen_second_monitor():
                 text_str = text_val if isinstance(text_val, str) else str(text_val)
                 if text_str:
                     extracted_lines.append(text_str)
+                    if region_w > 0 and region_h > 0:
+                        polygon = item.get("position")
+                        if polygon is not None and len(polygon) > 0:
+                            try:
+                                points = [tuple(p) for p in polygon]
+                                xs = [p[0] for p in points]
+                                ys = [p[1] for p in points]
+                                min_x, max_x = min(xs), max(xs)
+                                min_y, max_y = min(ys), max(ys)
+                                intersects = not (
+                                    max_x < region_x or
+                                    max_y < region_y or
+                                    min_x > region_right or
+                                    min_y > region_bottom
+                                )
+                                if intersects:
+                                    tts_line += text_str
+                            except Exception:
+                                pass
+                    else:
+                        tts_line += text_str
+            tts_lines.append(tts_line)
+            print(tts_lines)
             extracted_text_global = "\n".join(extracted_lines) if extracted_lines else str(extracted_text)
 
             def build_overlay_boxes(ocr_results):
@@ -167,6 +283,8 @@ def capture_screen_second_monitor():
 
             overlay_boxes_global = build_overlay_boxes(extracted_text)
             print(f"Extracted Text: {extracted_text}")
+            tts_text = "\n".join(tts_lines).strip()
+            speak_text(tts_text)
 
             capture_counter += 1
             capture_history.appendleft({
@@ -251,11 +369,12 @@ def show_translated_text():
             .overlay-text {
                 position: absolute;
                 color: red;
-                font-size: 16px;
+                font-size: 25px;
                 line-height: 1.2;
                 white-space: pre-wrap;
                 padding: 0;
                 margin: 0;
+                transform: translateY(-50px);
             }
             .history-item {
                 border: 1px solid #ccc;
@@ -285,7 +404,6 @@ def show_translated_text():
                 {% endfor %}
             </div>
         </body>
-        <img src="{{ image }}" width="854" height="460"/>
 
         <body>
             <h1>History (Last {{ history|length }} captures, max 50)</h1>
